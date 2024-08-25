@@ -18,20 +18,23 @@ cd ..
 pip install git+https://github.com/myshell-ai/MeloTTS.git
 python -m unidic download
 ```
+## Run
+
+```bash
+python3 her.py
+```
 
 ## OpenVoice V2 TTS converter
+Convert base specker voice to any other speaker.
 Download the checkpoint from [here](https://myshell-public-repo-host.s3.amazonaws.com/openvoice/checkpoints_v2_0417.zip) and extract it to the checkpoints_v2 folder.
 
 ```bash
 python3 convert_se.py \
 --ckpt_converter checkpoints_v2/converter \
---reference xjp_audio.mp3 \
---target_dir xjp_audio
-```
+--reference OpenVoice/resources/demo_speaker2.mp3 \
+--target_dir demo_speaker2
 
-## Run
-
-```bash
+# then
 python3 her.py \
---target_se demo_speaker1/se.pth
+--target_se demo_speaker2/se.pth
 ```

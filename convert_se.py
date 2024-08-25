@@ -22,6 +22,7 @@ def main():
                                                 tone_color_converter,
                                                 target_dir=args.target_dir,
                                                 vad=False)
+    torch.save(target_se, f'{args.target_dir}/se.pth')
 
 
 if __name__ == '__main__':
