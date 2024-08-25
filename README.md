@@ -1,5 +1,5 @@
 # local-her
-Speech-to-speech local AI assistant that is optimized for Mac silicon devices.
+Speech-to-speech local AI assistant that is optimized for Mac silicon devices. (Inspired by Huggingface [speech-to-speech](https://github.com/huggingface/speech-to-speech) project)
 
 ## Installation
 
