@@ -1,5 +1,5 @@
 # local-her
-
+Speech-to-speech local AI assistant that is optimized for Mac silicon devices.
 
 ## Installation
 
