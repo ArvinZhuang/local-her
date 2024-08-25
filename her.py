@@ -3,22 +3,35 @@ import sounddevice as sd
 import numpy as np
 from pynput import keyboard
 import torch
-from vad import VADIterator, int2float
 from melo.api import TTS
 from rich.console import Console
 from mlx_lm import load, stream_generate, generate
+import threading
+import nltk
+import re
+import time
+from openvoice.api import ToneColorConverter
+from transformers import AutoProcessor, AutoModel, BarkModel
+import soundfile
+import librosa
+from argparse import ArgumentParser
 
 console = Console()
 key_pressed = False
-fs = 44100  # Sample rate
 recording = []  # List to store audio chunks
-thresh = 0.3
-sample_rate = 16000
-min_silence_ms = 1000
-min_speech_ms = 500
-max_speech_ms = float("inf")
-speech_pad_ms = 30
-stt_model = 'mlx-community/whisper-large-v3-mlx-4bit'
+
+
+def int2float(sound):
+    """
+    Taken from https://github.com/snakers4/silero-vad
+    """
+
+    abs_max = np.abs(sound).max()
+    sound = sound.astype("float32")
+    if abs_max > 0:
+        sound *= 1 / 32768
+    sound = sound.squeeze()  # depends on the use case
+    return sound
 
 
 class Chat:
@@ -43,33 +56,81 @@ class Chat:
 
     def to_list(self):
         if self.init_chat_message:
-            return [self.init_chat_message] + self.buffer
+            return self.init_chat_message + self.buffer
         else:
             return self.buffer
 
 
+class ToneConverter:
+    def __init__(self, model, source_se, target_se, orig_sr, target_sr):
+        self.model = model
+        self.source_se = source_se
+        self.target_se = target_se
+        self.orig_sr = orig_sr
+        self.target_sr = target_sr
+
+    def convert(self, audio):
+        audio = librosa.resample(audio,
+                                 orig_sr=self.orig_sr,
+                                 target_sr=self.target_sr)
+        audio = self.model.convert_audio(
+            audio=audio,
+            src_se=self.source_se,
+            tgt_se=self.target_se)
+        return audio
+
+
 def main():
-    tts_model = TTS(language='ZH', device='mps')
+    argparse = ArgumentParser()
+    argparse.add_argument('--verbose', action='store_true')
+    argparse.add_argument('--stt_model', type=str, default='mlx-community/whisper-large-v3-mlx-4bit')
+    argparse.add_argument('--llm_model', type=str, default='mlx-community/gemma-2-2b-it-8bit')
+    argparse.add_argument('--tts_language', type=str, default='ZH')
+    argparse.add_argument('--ckpt_converter', type=str, default='checkpoints_v2/converter')
+    argparse.add_argument('--source_se', type=str, default='checkpoints_v2/base_speakers/ses/zh.pth')
+    argparse.add_argument('--target_se', type=str, default=None)
+    argparse.add_argument('--lm_max_tokens', type=int, default=100)
+    argparse.add_argument('--sample_rate', type=int, default=16000)
+    argparse.add_argument('--device', type=str, default='mps')
+
+    args = argparse.parse_args()
+
+    verbose = args.verbose
+    stt_model = args.stt_model
+    llm_model, tokenizer = load(args.llm_model)
+    tts_model = TTS(language=args.tts_language, device=args.device)
     speaker_ids = tts_model.hps.data.spk2id
-    llm_model, tokenizer = load('mlx-community/Qwen2-7B-Instruct-4bit')
+    ckpt_converter = args.ckpt_converter
+
+    if args.target_se is not None:
+        cv_model = ToneColorConverter(f'{ckpt_converter}/config.json', device=args.device)
+        cv_model.load_ckpt(f'{ckpt_converter}/checkpoint.pth')
+        tone_color_converter = ToneConverter(
+            model=cv_model,
+            source_se=torch.load(args.source_se, map_location=args.device),
+            target_se=torch.load(args.target_se, map_location=args.device),
+            orig_sr=tts_model.hps.data.sampling_rate,
+            target_sr=cv_model.hps.data.sampling_rate
+        )
+    else:
+        tone_color_converter = None
+
+    lm_max_tokens = args.lm_max_tokens
+    sample_rate = args.sample_rate
 
     # warm up
     _ = mlx_whisper.transcribe(np.array([0] * 512), path_or_hf_repo=stt_model, language='zh', fp16=True)["text"]
     test_audio = tts_model.tts_to_file('让我们开始吧!', speaker_ids['ZH'], quiet=True)
-    sd.play(test_audio, fs)
+    if tone_color_converter:
+        test_audio = tone_color_converter.convert(test_audio)
+        sd.play(test_audio, tone_color_converter.target_sr)
+    else:
+        sd.play(test_audio, tts_model.hps.data.sampling_rate)
 
-    chat = Chat(10)
-    chat.init_chat({"role": 'system', "content": '你是一个中文助手, 你会可以聊天和回答问题, 你的回答必须尽可能简短.'})
-
-    # model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad")
-
-    # iterator = VADIterator(
-    #     model,
-    #     threshold=thresh,
-    #     sampling_rate=sample_rate,
-    #     min_silence_duration_ms=min_silence_ms,
-    #     speech_pad_ms=speech_pad_ms,
-    # )
+    chat = Chat(5)
+    chat.init_chat(
+        [{"role": 'user', "content": '你是一个中文助手.用简短的话回答问题.'},
+         {"role": 'assistant', "content": '好的没问题!我一定会回答所有你的问题!并且用简短的语言.'}])
 
     # Create an audio stream
     def callback(indata, frames, time, status):
@@ -86,44 +147,59 @@ def main():
     def on_press(key):
         global key_pressed, recording
         try:
-            if key == keyboard.Key.cmd_r and not key_pressed:  # Change 'a' to the key you want to monitor
+            if key == keyboard.Key.cmd_r and not key_pressed:  # right size cmd
+                print("Listening...")
+                sd.stop()
                 key_pressed = True
                 recording = []  # Start with a new recording
                 stream.start()  # Start the audio stream
+
         except AttributeError:
             pass
 
     def on_release(key):
         global key_pressed
         try:
-            if key == keyboard.Key.cmd_r:  # Change 'a' to the key you want to monitor
+            if key == keyboard.Key.cmd_r:  # right size cmd
                 key_pressed = False
                 stream.stop()  # Stop the audio stream
 
-                if recording:  # Save the recording to a WAV file
+                if recording:
+                    # audio length in seconds
                     audio_int16 = np.array(recording).flatten()
+                    audio_length = len(audio_int16) / sample_rate
+
+                    if audio_length < 1:
+                        console.print("[red]No audio detected.")
+                        return
+
                     audio_float32 = int2float(audio_int16)
                     user_text = mlx_whisper.transcribe(audio_float32,
                                                        path_or_hf_repo=stt_model,
-                                                       language='zh',
                                                        fp16=True)["text"].strip()
-
-                    torch.mps.synchronize()  # Waits for all kernels in all streams on the MPS device to complete.
-                    torch.mps.empty_cache()  # Frees all memory allocated by the MPS device.
 
                     console.print(f"[yellow]USER: {user_text}")
                     chat.append({"role": 'user', "content": user_text})
-
                     prompt = tokenizer.apply_chat_template(chat.to_list(), tokenize=False, add_generation_prompt=True)
 
-                    response = generate(llm_model, tokenizer, prompt=prompt, verbose=False)
+                    response = generate(llm_model, tokenizer, prompt=prompt, verbose=verbose, max_tokens=lm_max_tokens)
+                    response = response.replace('<end_of_turn>', '')
+                    response = response.replace('\n', ' ')
 
                     console.print(f"[green]HER: {response}")
-
                     chat.append({"role": 'assistant', "content": response})
 
-                    audio_chunk = tts_model.tts_to_file(response, speaker_ids['ZH'], quiet=True)
-                    sd.play(audio_chunk, fs)
+                    sentences = tts_model.split_sentences_into_pieces(response, args.tts_language, quiet=True)
+                    for sentence in sentences:
+                        audio = tts_model.tts_to_file(sentence, speaker_ids[args.tts_language], quiet=True)
+                        sd.wait()
+                        if tone_color_converter:
+                            audio = tone_color_converter.convert(audio)
+                            sd.play(audio, tone_color_converter.target_sr)
+                        else:
+                            sd.play(audio, tts_model.hps.data.sampling_rate)
+                else:
+                    console.print("[red]No audio detected.")
 
         except AttributeError:
             pass
